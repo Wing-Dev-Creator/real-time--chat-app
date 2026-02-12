@@ -1,0 +1,22 @@
+{
+  "name": "instantly",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Instantly real-time chat (Socket.IO + React + TailwindCSS)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "server": "node server.js",
+    "client": "npm --prefix client run dev",
+    "build": "npm --prefix client run build",
+    "dev": "concurrently -k \"npm:server\" \"npm:client\""
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "socket.io": "^4.8.1"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  }
+}
