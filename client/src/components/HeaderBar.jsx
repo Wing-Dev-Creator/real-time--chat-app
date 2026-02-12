@@ -10,10 +10,10 @@ function HeaderBar({ displayName, onNameChange, isConnected, socketUrl }) {
             Instantly
           </p>
           <h1 className="text-2xl font-bold text-ink md:text-3xl">
-            Live character chat stream
+            1-on-1 live messaging
           </h1>
           <p className="mt-1 text-sm text-ink/70">
-            Everyone sees every keystroke as it lands.
+            Pick one person and both of you see each character as it is typed.
           </p>
         </div>
 

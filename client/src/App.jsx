@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { io } from "socket.io-client";
 import HeaderBar from "./components/HeaderBar";
 import MessageList from "./components/MessageList";
-import TypingFeed from "./components/TypingFeed";
+import PeerList from "./components/PeerList";
 
 const MAX_TEXT_LENGTH = 500;
 const TYPING_STALE_AFTER_MS = 2500;
@@ -19,23 +19,73 @@ function sanitizeText(raw) {
   return String(raw || "").slice(0, MAX_TEXT_LENGTH);
 }
 
+function sanitizeUserId(raw) {
+  return String(raw || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]/g, "")
+    .slice(0, 48);
+}
+
+function createUserId() {
+  if (typeof crypto !== "undefined" && crypto.randomUUID) {
+    return `user_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
+  }
+  return `user_${Math.random().toString(16).slice(2, 18)}`;
+}
+
 function App() {
   const [displayName, setDisplayName] = useState(
     () => localStorage.getItem("instantly:displayName") || ""
   );
+  const [localUserId, setLocalUserId] = useState(
+    () => sanitizeUserId(localStorage.getItem("instantly:userId")) || createUserId()
+  );
+  const [selfUserId, setSelfUserId] = useState("");
   const [draft, setDraft] = useState("");
-  const [messages, setMessages] = useState([]);
-  const [typingBySocket, setTypingBySocket] = useState({});
+  const [messagesByPeer, setMessagesByPeer] = useState({});
+  const [typingByPeer, setTypingByPeer] = useState({});
+  const [presenceUsers, setPresenceUsers] = useState([]);
+  const [activePeerId, setActivePeerId] = useState("");
   const [isConnected, setIsConnected] = useState(false);
   const socketRef = useRef(null);
-  const currentNameRef = useRef(sanitizeName(displayName));
+  const currentNameRef = useRef(sanitizeName(displayName) || "Guest");
+  const currentUserIdRef = useRef(localUserId);
 
-  const typingEntries = useMemo(
+  const peers = useMemo(
     () =>
-      Object.values(typingBySocket).sort(
-        (left, right) => right.updatedAt - left.updatedAt
+      presenceUsers
+        .filter((user) => user.userId !== selfUserId)
+        .sort((left, right) => {
+          if (left.online !== right.online) {
+            return left.online ? -1 : 1;
+          }
+          return right.lastSeen - left.lastSeen;
+        }),
+    [presenceUsers, selfUserId]
+  );
+
+  const activePeer = useMemo(
+    () => peers.find((peer) => peer.userId === activePeerId) || null,
+    [peers, activePeerId]
+  );
+
+  const activeMessages = useMemo(
+    () => messagesByPeer[activePeerId] || [],
+    [messagesByPeer, activePeerId]
+  );
+
+  const activeTyping = useMemo(
+    () => typingByPeer[activePeerId] || null,
+    [typingByPeer, activePeerId]
+  );
+
+  const totalMessages = useMemo(
+    () =>
+      Object.values(messagesByPeer).reduce(
+        (total, list) => total + list.length,
+        0
       ),
-    [typingBySocket]
+    [messagesByPeer]
   );
 
   useEffect(() => {
@@ -48,43 +98,102 @@ function App() {
 
     socket.on("connect", () => {
       setIsConnected(true);
-      socket.emit("chat:set_name", { name: currentNameRef.current });
+      socket.emit("dm:identify", {
+        userId: currentUserIdRef.current,
+        name: currentNameRef.current
+      });
     });
 
     socket.on("disconnect", () => {
       setIsConnected(false);
     });
 
-    socket.on("chat:message", (message) => {
-      setMessages((prev) => [...prev.slice(-MESSAGE_LIMIT + 1), message]);
+    socket.on("dm:self", (payload) => {
+      const nextUserId = sanitizeUserId(payload?.userId) || currentUserIdRef.current;
+      currentUserIdRef.current = nextUserId;
+      setSelfUserId(nextUserId);
+      setLocalUserId(nextUserId);
+      localStorage.setItem("instantly:userId", nextUserId);
+
+      const incomingName = sanitizeName(payload?.name || currentNameRef.current);
+      currentNameRef.current = incomingName;
+      setDisplayName(incomingName);
+      localStorage.setItem("instantly:displayName", incomingName);
     });
 
-    socket.on("chat:typing", (payload) => {
-      const socketId = String(payload?.socketId || "");
-      if (!socketId) {
+    socket.on("dm:presence", (payload) => {
+      const users = Array.isArray(payload?.users) ? payload.users : [];
+      setPresenceUsers(
+        users.map((user) => ({
+          userId: sanitizeUserId(user.userId),
+          name: sanitizeName(user.name),
+          online: Boolean(user.online),
+          lastSeen: Number(user.lastSeen || Date.now())
+        }))
+      );
+    });
+
+    socket.on("dm:message", (payload) => {
+      const fromUserId = sanitizeUserId(payload?.fromUserId);
+      const toUserId = sanitizeUserId(payload?.toUserId);
+      if (!fromUserId || !toUserId) {
+        return;
+      }
+
+      const viewerId = currentUserIdRef.current;
+      const peerUserId = fromUserId === viewerId ? toUserId : fromUserId;
+      if (!peerUserId) {
+        return;
+      }
+
+      const message = {
+        id: String(payload?.id || `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`),
+        fromUserId,
+        fromName: sanitizeName(payload?.fromName),
+        toUserId,
+        text: sanitizeText(payload?.text),
+        createdAt: Number(payload?.createdAt || Date.now())
+      };
+
+      if (!message.text.trim()) {
+        return;
+      }
+
+      setMessagesByPeer((prev) => {
+        const nextList = [...(prev[peerUserId] || []), message].slice(-MESSAGE_LIMIT);
+        return {
+          ...prev,
+          [peerUserId]: nextList
+        };
+      });
+    });
+
+    socket.on("dm:typing", (payload) => {
+      const fromUserId = sanitizeUserId(payload?.fromUserId);
+      if (!fromUserId || fromUserId === currentUserIdRef.current) {
         return;
       }
 
       const incoming = {
-        socketId,
-        name: sanitizeName(payload?.name),
+        fromUserId,
+        fromName: sanitizeName(payload?.fromName),
         draft: sanitizeText(payload?.draft),
         updatedAt: Number(payload?.updatedAt || Date.now())
       };
 
-      setTypingBySocket((prev) => {
+      setTypingByPeer((prev) => {
         if (!incoming.draft.trim()) {
-          if (!prev[socketId]) {
+          if (!prev[fromUserId]) {
             return prev;
           }
           const next = { ...prev };
-          delete next[socketId];
+          delete next[fromUserId];
           return next;
         }
 
         return {
           ...prev,
-          [socketId]: incoming
+          [fromUserId]: incoming
         };
       });
     });
@@ -99,18 +208,32 @@ function App() {
     const normalized = sanitizeName(displayName);
     currentNameRef.current = normalized;
     localStorage.setItem("instantly:displayName", displayName);
-    socketRef.current?.emit("chat:set_name", { name: normalized });
+    socketRef.current?.emit("dm:set_name", { name: normalized });
   }, [displayName]);
+
+  useEffect(() => {
+    const normalizedId = sanitizeUserId(localUserId) || createUserId();
+    currentUserIdRef.current = normalizedId;
+    setLocalUserId(normalizedId);
+    localStorage.setItem("instantly:userId", normalizedId);
+  }, [localUserId]);
+
+  useEffect(() => {
+    if (activePeerId && peers.some((peer) => peer.userId === activePeerId)) {
+      return;
+    }
+    setActivePeerId(peers[0]?.userId || "");
+  }, [activePeerId, peers]);
 
   useEffect(() => {
     const cleanup = window.setInterval(() => {
       const now = Date.now();
-      setTypingBySocket((prev) => {
+      setTypingByPeer((prev) => {
         let changed = false;
         const next = { ...prev };
-        for (const [socketId, entry] of Object.entries(prev)) {
+        for (const [peerId, entry] of Object.entries(prev)) {
           if (now - entry.updatedAt > TYPING_STALE_AFTER_MS) {
-            delete next[socketId];
+            delete next[peerId];
             changed = true;
           }
         }
@@ -125,11 +248,11 @@ function App() {
 
   const broadcastTyping = (nextDraft) => {
     const socket = socketRef.current;
-    if (!socket) {
+    if (!socket || !activePeerId) {
       return;
     }
-    socket.emit("chat:typing", {
-      name: currentNameRef.current,
+    socket.emit("dm:typing", {
+      toUserId: activePeerId,
       draft: sanitizeText(nextDraft)
     });
   };
@@ -144,15 +267,21 @@ function App() {
     broadcastTyping(nextDraft);
   };
 
+  const handlePeerSelect = (peerId) => {
+    setActivePeerId(peerId);
+    setDraft("");
+    broadcastTyping("");
+  };
+
   const handleSubmit = (event) => {
     event.preventDefault();
     const text = sanitizeText(draft);
-    if (!text.trim()) {
+    if (!text.trim() || !activePeerId) {
       return;
     }
 
-    socketRef.current?.emit("chat:message", {
-      name: currentNameRef.current,
+    socketRef.current?.emit("dm:message", {
+      toUserId: activePeerId,
       text
     });
     setDraft("");
@@ -171,14 +300,21 @@ function App() {
       <section className="grid flex-1 grid-cols-1 gap-4 lg:grid-cols-[1.45fr_1fr]">
         <div className="glass-panel flex min-h-[420px] flex-col gap-3 p-4">
           <div className="flex items-center justify-between">
-            <h2 className="text-lg font-bold text-ink">Message Timeline</h2>
+            <h2 className="text-lg font-bold text-ink">
+              {activePeer ? `Chat with ${activePeer.name}` : "Direct Messages"}
+            </h2>
             <span className="font-mono text-xs uppercase tracking-[0.18em] text-ink/55">
-              {messages.length} stored
+              {totalMessages} stored
             </span>
           </div>
 
           <div className="min-h-[260px] flex-1">
-            <MessageList messages={messages} />
+            <MessageList
+              messages={activeMessages}
+              selfUserId={selfUserId}
+              activePeer={activePeer}
+              activeTyping={activeTyping}
+            />
           </div>
 
           <form
@@ -193,7 +329,12 @@ function App() {
               onChange={handleDraftChange}
               maxLength={MAX_TEXT_LENGTH}
               rows={3}
-              placeholder="Type a message. Other users can watch every character live."
+              placeholder={
+                activePeer
+                  ? `Message ${activePeer.name}...`
+                  : "Select a person to start messaging..."
+              }
+              disabled={!activePeer}
               className="w-full resize-none rounded-xl border border-ocean/25 bg-white px-3 py-2 text-sm text-ink outline-none transition focus:border-ocean/70"
             />
             <div className="mt-2 flex items-center justify-between">
@@ -202,6 +343,7 @@ function App() {
               </span>
               <button
                 type="submit"
+                disabled={!activePeer}
                 className="rounded-lg bg-ink px-4 py-2 text-sm font-semibold text-white transition hover:bg-ocean"
               >
                 Send
@@ -212,12 +354,18 @@ function App() {
 
         <aside className="glass-panel min-h-[420px] p-4">
           <div className="mb-3 flex items-center justify-between">
-            <h2 className="text-lg font-bold text-ink">Live Typing Feed</h2>
+            <h2 className="text-lg font-bold text-ink">People</h2>
             <span className="font-mono text-xs uppercase tracking-[0.18em] text-ink/55">
-              {typingEntries.length} active
+              {peers.length} peer{peers.length === 1 ? "" : "s"}
             </span>
           </div>
-          <TypingFeed typingEntries={typingEntries} />
+          <PeerList
+            peers={peers}
+            activePeerId={activePeerId}
+            onSelectPeer={handlePeerSelect}
+            messagesByPeer={messagesByPeer}
+            typingByPeer={typingByPeer}
+          />
         </aside>
       </section>
     </div>
